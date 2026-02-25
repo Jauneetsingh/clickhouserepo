@@ -2,6 +2,14 @@
 
 Run each command one at a time. Read the expected output and notes before moving to the next step.
 
+Each phase uses **different container names and ports** so they don't conflict with each other.
+
+| Phase | Keeper Container | Server Container | Ports |
+|-------|-----------------|-----------------|-------|
+| 1 (Broken) | `broken-keeper` | `broken-server` | 18123, 19000, 19181 |
+| 2 (Partial Fix) | `partial-keeper` | `partial-server` | 28123, 29000, 29181 |
+| 3 (Full Fix) | `fixed-keeper` | `fixed-server` | 38123, 39000, 39181 |
+
 > All commands assume you are in the project root: `cd ~/clickhouse1`
 
 ---
@@ -22,14 +30,14 @@ docker compose -f docker-compose-troubleshoot.yml up -d
 ### Step 2 — Check container status
 
 ```bash
-docker ps -a --format "table {{.Names}}\t{{.Status}}" --filter name=clickhouse
+docker ps -a --format "table {{.Names}}\t{{.Status}}" --filter name=broken
 ```
 
 **Expected:**
 ```
-NAMES               STATUS
-clickhouse-server   Up X seconds
-clickhouse-keeper   Exited (232) X seconds ago
+NAMES            STATUS
+broken-server    Up X seconds
+broken-keeper    Exited (232) X seconds ago
 ```
 
 **Observation:** Keeper has **crashed with exit code 232**. The server is running but Keeper is dead.
@@ -39,7 +47,7 @@ clickhouse-keeper   Exited (232) X seconds ago
 ### Step 3 — Check Keeper logs to find the error
 
 ```bash
-docker logs clickhouse-keeper
+docker logs broken-keeper
 ```
 
 **Expected output (key line):**
@@ -69,7 +77,7 @@ XML does not allow tag names to span multiple lines. The same problem repeats fo
 ### Step 5 — Confirm the server can't reach Keeper
 
 ```bash
-docker exec clickhouse-server clickhouse-client --query "SELECT * FROM system.zookeeper_connection"
+docker exec broken-server clickhouse-client --query "SELECT * FROM system.zookeeper_connection"
 ```
 
 **Expected:**
@@ -77,7 +85,7 @@ docker exec clickhouse-server clickhouse-client --query "SELECT * FROM system.zo
 Code: 999. DB::Exception: Cannot use any of provided ZooKeeper nodes. (KEEPER_EXCEPTION)
 ```
 
-**Observation:** Server is running but has no Keeper coordination, which means replicated tables, distributed DDL, etc. will not work.
+**Observation:** Server is running but has no Keeper coordination.
 
 ---
 
@@ -91,7 +99,7 @@ docker compose -f docker-compose-troubleshoot.yml down -v
 
 ## PHASE 2: Fix #1 — Repair the XML Tags (Partial Fix)
 
-We have a config with all XML tags fixed but `listen_host` still inside `<keeper_server>` (as the customer wrote it). Let's see if that's enough.
+We fixed all the broken XML tag names but kept `listen_host` inside `<keeper_server>` (exactly as the customer intended). Let's see if that's enough.
 
 ### Step 7 — Look at the partially fixed config
 
@@ -99,7 +107,7 @@ We have a config with all XML tags fixed but `listen_host` still inside `<keeper
 cat partial-fix-keeper-config/keeper_config.xml
 ```
 
-**Observation:** All tags are now on single lines. But notice `<listen_host>0.0.0.0</listen_host>` is inside `<keeper_server>`. Keep this in mind.
+**Observation:** All tags are now on single lines. But notice `<listen_host>0.0.0.0</listen_host>` is on line 10 inside `<keeper_server>`. Keep this in mind.
 
 ---
 
@@ -111,17 +119,18 @@ docker compose -f docker-compose-partial-fix.yml up -d
 
 ---
 
-### Step 9 — Check container status
+### Step 9 — Check container status (wait 5 seconds first)
 
 ```bash
-docker ps -a --format "table {{.Names}}\t{{.Status}}" --filter name=clickhouse
+sleep 5
+docker ps -a --format "table {{.Names}}\t{{.Status}}" --filter name=partial
 ```
 
 **Expected:**
 ```
-NAMES               STATUS
-clickhouse-server   Up X seconds
-clickhouse-keeper   Up X seconds
+NAMES             STATUS
+partial-server    Up X seconds
+partial-keeper    Up X seconds
 ```
 
 **Observation:** Both containers are now running. The XML fix worked — Keeper no longer crashes.
@@ -131,7 +140,7 @@ clickhouse-keeper   Up X seconds
 ### Step 10 — But can the server actually connect to Keeper?
 
 ```bash
-docker exec clickhouse-server clickhouse-client --query "SELECT * FROM system.zookeeper_connection"
+docker exec partial-server clickhouse-client --query "SELECT * FROM system.zookeeper_connection"
 ```
 
 **Expected:**
@@ -147,7 +156,7 @@ Poco::Exception. Code: 1000, e.code() = 111, Connection refused
 ### Step 11 — Check what address Keeper is listening on
 
 ```bash
-docker exec clickhouse-keeper grep -i "Listening" /var/log/clickhouse-keeper/clickhouse-keeper.log
+docker exec partial-keeper grep -i "Listening" /var/log/clickhouse-keeper/clickhouse-keeper.log
 ```
 
 **Expected:**
@@ -156,17 +165,17 @@ Application: Listening for Keeper (tcp): [::1]:9181
 Application: Listening for Keeper (tcp): 127.0.0.1:9181
 ```
 
-**Observation:** Keeper is listening on `127.0.0.1` (localhost only). The ClickHouse server is in a different container with a different IP address, so it cannot reach `127.0.0.1` on the Keeper container. The `<listen_host>0.0.0.0</listen_host>` setting was **ignored** because it was placed inside `<keeper_server>` — it needs to be at the root `<clickhouse>` level.
+**Observation:** Keeper is listening on `127.0.0.1` (localhost only). The server is in a different container with a different IP, so it cannot reach `127.0.0.1`. The `<listen_host>0.0.0.0</listen_host>` was **ignored** because it was inside `<keeper_server>` — it must be at the root `<clickhouse>` level.
 
 ---
 
-### Step 12 — Verify by checking the Keeper container's IP
+### Step 12 — Verify by checking the Keeper container's network IP
 
 ```bash
-docker exec clickhouse-server ping -c 1 clickhouse-keeper
+docker exec partial-server ping -c 1 partial-keeper
 ```
 
-**Observation:** The server resolves `clickhouse-keeper` to something like `172.x.x.x`, not `127.0.0.1`. That confirms why it can't connect — Keeper isn't listening on that interface.
+**Observation:** The server resolves `partial-keeper` to something like `172.x.x.x`, not `127.0.0.1`. That confirms why it can't connect.
 
 ---
 
@@ -186,7 +195,7 @@ docker compose -f docker-compose-partial-fix.yml down -v
 cat clickhouse-keeper/keeper_config.xml
 ```
 
-**Key difference:** `<listen_host>0.0.0.0</listen_host>` is now at the `<clickhouse>` root level, NOT inside `<keeper_server>`.
+**Key difference:** Line 2 — `<listen_host>0.0.0.0</listen_host>` is now directly under `<clickhouse>`, NOT inside `<keeper_server>`.
 
 ---
 
@@ -202,17 +211,17 @@ docker compose up -d
 
 ```bash
 sleep 10
-docker ps -a --format "table {{.Names}}\t{{.Status}}" --filter name=clickhouse
+docker ps -a --format "table {{.Names}}\t{{.Status}}" --filter name=fixed
 ```
 
-**Expected:** Both containers are `Up`.
+**Expected:** Both `fixed-keeper` and `fixed-server` are `Up`.
 
 ---
 
 ### Step 17 — Verify Keeper is listening on 0.0.0.0
 
 ```bash
-docker exec clickhouse-keeper grep -i "Listening" /var/log/clickhouse-keeper/clickhouse-keeper.log
+docker exec fixed-keeper grep -i "Listening" /var/log/clickhouse-keeper/clickhouse-keeper.log
 ```
 
 **Expected:**
@@ -227,12 +236,12 @@ Application: Listening for Keeper (tcp): 0.0.0.0:9181
 ### Step 18 — Verify the server connects to Keeper successfully
 
 ```bash
-docker exec clickhouse-server clickhouse-client --query "SELECT host, port, is_expired FROM system.zookeeper_connection"
+docker exec fixed-server clickhouse-client --query "SELECT host, port, is_expired FROM system.zookeeper_connection"
 ```
 
 **Expected:**
 ```
-clickhouse-keeper    9181    0
+fixed-keeper    9181    0
 ```
 
 **Observation:** Connection established. `is_expired = 0` means the session is healthy.
@@ -241,10 +250,10 @@ clickhouse-keeper    9181    0
 
 ## PHASE 4: Verify All Customer Requirements
 
-### Step 19 — Requirement 1: Database limit set to 3
+### Step 19 — Requirement 1: Database limit is set to 3
 
 ```bash
-docker exec clickhouse-server clickhouse-client --query "SELECT name, value FROM system.server_settings WHERE name='max_database_num_to_throw'"
+docker exec fixed-server clickhouse-client --query "SELECT name, value FROM system.server_settings WHERE name='max_database_num_to_throw'"
 ```
 
 **Expected:**
@@ -257,12 +266,16 @@ max_database_num_to_throw    3
 ### Step 20 — Requirement 1: Prove the limit works
 
 ```bash
-docker exec clickhouse-server clickhouse-client --query "CREATE DATABASE test_db1"
-docker exec clickhouse-server clickhouse-client --query "CREATE DATABASE test_db2"
-docker exec clickhouse-server clickhouse-client --query "CREATE DATABASE test_db3"
+docker exec fixed-server clickhouse-client --query "CREATE DATABASE test_db1"
+```
+```bash
+docker exec fixed-server clickhouse-client --query "CREATE DATABASE test_db2"
+```
+```bash
+docker exec fixed-server clickhouse-client --query "CREATE DATABASE test_db3"
 ```
 
-**Expected:** First two succeed, third one fails with:
+**Expected:** First two succeed. Third fails with:
 ```
 Code: 725. DB::Exception: Too many databases. The limit is set to 3,
 the current number of databases is 3. (TOO_MANY_DATABASES)
@@ -273,8 +286,8 @@ the current number of databases is 3. (TOO_MANY_DATABASES)
 ### Step 21 — Clean up test databases
 
 ```bash
-docker exec clickhouse-server clickhouse-client --query "DROP DATABASE IF EXISTS test_db1"
-docker exec clickhouse-server clickhouse-client --query "DROP DATABASE IF EXISTS test_db2"
+docker exec fixed-server clickhouse-client --query "DROP DATABASE IF EXISTS test_db1"
+docker exec fixed-server clickhouse-client --query "DROP DATABASE IF EXISTS test_db2"
 ```
 
 ---
@@ -282,7 +295,7 @@ docker exec clickhouse-server clickhouse-client --query "DROP DATABASE IF EXISTS
 ### Step 22 — Requirement 2a: Admin user works with no limits
 
 ```bash
-docker exec clickhouse-server clickhouse-client --user admin --password admin_password --query "SELECT currentUser(), 'connected'"
+docker exec fixed-server clickhouse-client --user admin --password admin_password --query "SELECT currentUser(), 'connected'"
 ```
 
 **Expected:**
@@ -295,7 +308,7 @@ admin    connected
 ### Step 23 — Requirement 2b: Developer user has correct settings
 
 ```bash
-docker exec clickhouse-server clickhouse-client --user developer --password developer_password --query "SELECT name, value FROM system.settings WHERE name IN ('max_execution_time', 'max_memory_usage')"
+docker exec fixed-server clickhouse-client --user developer --password developer_password --query "SELECT name, value FROM system.settings WHERE name IN ('max_execution_time', 'max_memory_usage')"
 ```
 
 **Expected:**
@@ -309,7 +322,7 @@ max_memory_usage      104857600
 ### Step 24 — Requirement 2b-i: Prove 500ms timeout works
 
 ```bash
-docker exec clickhouse-server clickhouse-client --user developer --password developer_password --query "SELECT sleep(2)"
+docker exec fixed-server clickhouse-client --user developer --password developer_password --query "SELECT sleep(2)"
 ```
 
 **Expected:**
@@ -322,7 +335,7 @@ Code: 159. DB::Exception: Timeout exceeded: elapsed ... ms, maximum: 500 ms. (TI
 ### Step 25 — Requirement 2b-i: Prove 100MB memory limit works
 
 ```bash
-docker exec clickhouse-server clickhouse-client --user developer --password developer_password --query "SELECT count() FROM (SELECT arrayJoin(range(50000000)) AS x ORDER BY x)"
+docker exec fixed-server clickhouse-client --user developer --password developer_password --query "SELECT count() FROM (SELECT arrayJoin(range(50000000)) AS x ORDER BY x)"
 ```
 
 **Expected:**
@@ -336,7 +349,7 @@ maximum: 100.00 MiB. (MEMORY_LIMIT_EXCEEDED)
 ### Step 26 — Requirement 2b-ii: Admin sees system database in system.tables
 
 ```bash
-docker exec clickhouse-server clickhouse-client --user admin --password admin_password --query "SELECT DISTINCT database FROM system.tables ORDER BY database"
+docker exec fixed-server clickhouse-client --user admin --password admin_password --query "SELECT DISTINCT database FROM system.tables ORDER BY database"
 ```
 
 **Expected:** Shows `INFORMATION_SCHEMA`, `information_schema`, `system`.
@@ -346,10 +359,10 @@ docker exec clickhouse-server clickhouse-client --user admin --password admin_pa
 ### Step 27 — Requirement 2b-ii: Developer does NOT see system database
 
 ```bash
-docker exec clickhouse-server clickhouse-client --user developer --password developer_password --query "SELECT DISTINCT database FROM system.tables ORDER BY database"
+docker exec fixed-server clickhouse-client --user developer --password developer_password --query "SELECT DISTINCT database FROM system.tables ORDER BY database"
 ```
 
-**Expected:** Shows `INFORMATION_SCHEMA`, `information_schema` only. No `system`.
+**Expected:** Shows `INFORMATION_SCHEMA`, `information_schema` only. **No `system`.**
 
 ---
 
